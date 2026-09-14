@@ -1,0 +1,3 @@
+[submodule "vendor/emboss"]
+	path = vendor/emboss
+	url = https://github.com/tobiasvonarx/emboss.git

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shading-aware-pv"
+version = "0.1.0"
+description = "Shading-aware photovoltaic yield and module placement"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "emboss", "building-data[imagery]", "moderngl==5.12.0", "pvlib==0.15.2",
+  "numpy==2.4.3", "pandas==3.0.1", "scipy==1.17.1", "shapely==2.1.2",
+  "pyogrio>=0.11", "rasterio==1.5.0", "affine==2.4.0", "tifffile==2026.3.3", "laspy[lazrs]>=2.5", "fastapi==0.116.1",
+  "uvicorn[standard]==0.35.0", "python-dotenv>=1.0", "filelock>=3.18",
+]
+
+[project.scripts]
+shading-aware-pv = "shading_aware_pv.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.4", "httpx>=0.28"]
+
+[tool.uv.sources]
+emboss = { path = "vendor/emboss", editable = true }
+building-data = { path = "vendor/emboss/packages/building-data", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

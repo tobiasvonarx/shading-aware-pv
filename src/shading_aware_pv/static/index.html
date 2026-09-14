@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shading-aware PV</title>
+  <link rel="stylesheet" href="/emboss-imagery/style.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.plot.ly/plotly-3.1.0.min.js" defer></script>
+  <script src="/static/app.js" type="module"></script>
+</head>
+<body>
+<a class="skip-link" href="#workspace">Skip to workspace</a>
+<header class="app-header">
+  <a class="brand" href="#find">Shading-aware PV</a>
+  <nav aria-label="Workspace">
+    <a href="#find" id="nav-find" aria-current="page">Find buildings</a>
+    <a href="#analyses" id="nav-analyses">My analyses <span id="analysis-count" hidden></span></a>
+  </nav>
+</header>
+<main id="workspace" tabindex="-1">
+  <section id="find-view" aria-labelledby="find-title">
+    <h1 id="find-title">Find buildings</h1>
+    <div class="find-layout">
+      <div class="map-workspace"><iframe title="Find and prepare Swiss buildings" src="/acquire"></iframe></div>
+      <aside class="analysis-settings" aria-labelledby="settings-title">
+        <h2 id="settings-title" tabindex="-1">Analysis settings</h2>
+        <p id="selection-note" class="muted" role="status">Loading saved buildings…</p>
+        <form id="analysis-form">
+          <label>Building<select id="houses"><option value="">Prepare a building on the map</option></select></label>
+          <label>Weather year<input id="year" type="number" value="2023" required></label>
+          <details id="advanced" class="disclosure">
+            <summary>Advanced settings</summary>
+            <div class="advanced-fields">
+              <label>Neighborhood half-extent (m)<input id="context" type="number" value="100" min="0" step="any" required></label>
+              <label>Module power<select id="power-basis"><option value="geometry">Infer from module area</option><option value="module_wattage_w">Module wattage (W)</option><option value="dc_capacity_kwp">Installed capacity (kWp)</option></select></label>
+              <label id="power-label" hidden><span id="power-name">Power value</span><input id="power-value" type="number" min="0.01" step="any"></label>
+              <label>General losses (%)<input id="loss" type="number" value="0" min="0" max="99.9" step="any" required></label>
+              <label>DC / AC ratio<input id="dc-ac" type="number" value="1.15" min="0.01" step="any" required></label>
+              <label>Installed inverter limit (kW)<input id="inverter" type="number" min="0.01" step="any" placeholder="Automatic from ratio"></label>
+              <label>Inverter efficiency (%)<input id="efficiency" type="number" value="96" min="0.01" max="100" step="any" required></label>
+            </div>
+          </details>
+          <div class="analysis-action">
+            <button id="run" type="submit" disabled>Review orthophotos</button>
+            <button id="run-all" type="submit" hidden disabled>Review orthophotos</button>
+          </div>
+        </form>
+        <p id="status" class="feedback" role="status"></p>
+      </aside>
+    </div>
+  </section>
+  <section id="analyses-view" aria-labelledby="analyses-title" hidden>
+    <div class="page-heading"><h1 id="analyses-title">My analyses</h1><a href="#find" id="new-analysis" class="button secondary" hidden>New analysis</a></div>
+    <section id="history" aria-label="Saved analyses">
+      <div id="run-toolbar" class="run-toolbar" hidden>
+        <label>Analysis run<select id="runs"><option value="">Loading analyses…</option></select></label>
+        <button id="remove-run" class="secondary" disabled>Remove run</button>
+      </div>
+      <p id="run-summary" class="muted" role="status">Loading analyses…</p>
+      <div id="history-empty" class="empty-state" hidden><h2>No analyses yet</h2><p>Find a building to estimate sunlight, energy yield and panel placement.</p><a href="#find" class="button">Find buildings</a></div>
+      <p id="history-status" class="feedback" role="status"></p>
+      <div id="report-list" class="table-scroll" hidden>
+        <table><caption class="sr-only">Reports in the selected analysis run</caption><thead><tr><th scope="col">Building</th><th scope="col">Analysis status</th><th scope="col">Report</th></tr></thead><tbody id="job-rows"></tbody></table>
+      </div>
+      <details id="removed-items" class="disclosure"><summary>Removed items <span id="removed-count"></span></summary><ul id="trash-list"><li class="muted">Loading removed items…</li></ul></details>
+    </section>
+    <div id="result-status" class="feedback" role="status"></div>
+    <section id="results" class="results" aria-labelledby="result-title" hidden>
+      <div class="result-heading"><div><h2 id="result-title">Solar potential</h2><p id="result-building" class="muted"></p></div><div class="result-actions"><button id="change-image" class="secondary">Change orthophoto &amp; rerun</button><a id="download" class="button secondary">Download JSON</a></div></div>
+      <div class="result-controls">
+        <div class="layout-control"><span id="layout-label">Layout</span><div id="design" class="layout-options" role="group" aria-labelledby="layout-label"></div></div>
+        <label>Shading<select id="state"><option value="full">All shading</option><option value="context_no_vegetation">Without vegetation</option><option value="local">Roof and details</option><option value="roof">Base roof</option><option value="unshaded">Terrain horizon</option><option value="open_horizon">Open horizon</option></select></label>
+      </div>
+      <div id="panel-control" class="panel-control" hidden>
+        <label for="panel-count">Panels in new design <output id="panel-count-value" for="panel-count"></output></label>
+        <input id="panel-count" type="range" min="0" max="0" step="1" value="0" disabled aria-describedby="panel-range">
+        <div id="panel-range" class="panel-range"><span>0 panels</span><span id="panel-maximum"></span></div>
+        <p id="design-status" class="feedback" role="status"></p>
+      </div>
+      <p id="summary" class="result-summary"></p>
+      <div class="visualizations"><div id="scene" role="img" aria-label="Interactive roof geometry, panel layout and irradiation"></div><div id="chart" role="img" aria-label="Monthly modeled AC energy"></div></div>
+      <p id="notes" class="muted"></p>
+    </section>
+  </section>
+</main>
+<dialog id="image-dialog" aria-labelledby="gallery-title">
+  <header class="gallery-header"><div><h2 id="gallery-title">Choose an orthophoto</h2><p>Select the image that best matches the footprint.</p></div><button id="close-gallery" class="secondary" aria-label="Close image chooser">Close</button></header>
+  <div id="gallery-buildings" aria-label="Buildings to review"></div>
+  <div class="gallery-toolbar"><p id="gallery-status" role="status" aria-live="polite"></p><label><input id="gallery-footprint" type="checkbox" checked> Roof footprint</label></div>
+  <div class="gallery-content"><div id="image-gallery"></div><button id="retry-gallery" class="secondary" hidden>Retry loading images</button></div>
+  <p id="gallery-error" class="feedback" role="alert"></p>
+  <footer class="gallery-footer"><p id="gallery-note"></p><div><button id="cancel-gallery" class="secondary">Cancel</button><button id="confirm-gallery" disabled>Confirm image</button></div></footer>
+</dialog>
+</body>
+</html>
