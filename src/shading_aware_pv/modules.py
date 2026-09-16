@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +104,15 @@ class _Observation:
     resolution_m: float
     allowed_uv: BaseGeometry
     blocked_uv: BaseGeometry
+    _phase_cache: dict[tuple[float, bool], tuple[float, ...]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    @cached_property
+    def mask_coordinates(self) -> tuple[np.ndarray, np.ndarray]:
+        """Invariant pixel coordinates for this observation's fitting sweep."""
+        rows, columns = np.nonzero(self.mask)
+        return self.u[columns], self.v[rows]
 
 
 @dataclass(frozen=True)
@@ -421,6 +431,9 @@ def _phase_values(
     *,
     along_u: bool,
 ) -> tuple[float, ...]:
+    key = (pitch, along_u)
+    if key in observation._phase_cache:
+        return observation._phase_cache[key]
     lower, upper = (
         (observation.geometry_uv.bounds[0], observation.geometry_uv.bounds[2])
         if along_u
@@ -446,7 +459,9 @@ def _phase_values(
     for phase in proposals:
         if not any(abs(phase - existing) < observation.resolution_m * 0.5 for existing in unique):
             unique.append(phase)
-    return tuple(unique)
+    result = tuple(unique)
+    observation._phase_cache[key] = result
+    return result
 
 
 def _mask_metrics(true_positive: float, predicted: float, observed: float) -> tuple[float, float, float]:
@@ -484,6 +499,32 @@ def _boundary_score(
     return (float(np.mean(samples)), len(samples)) if samples else (None, 0)
 
 
+def _cell_counts(
+    rows: np.ndarray, columns: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Count grid cells in the same lexicographic order as np.unique(axis=0).
+
+    The observed pixels usually occupy a small cell grid, where integer bins
+    avoid sorting pairs. Retain the original algorithm for sparse, large spans
+    so memory use stays bounded and integer cell encoding cannot overflow.
+    """
+    if not len(rows):
+        return np.empty((0, 2), dtype=np.int64), np.empty(0, dtype=np.int64)
+    row_min, column_min = int(rows.min()), int(columns.min())
+    width = int(columns.max()) - column_min + 1
+    size = (int(rows.max()) - row_min + 1) * width
+    if size > max(256, len(rows) * 4):
+        return np.unique(np.column_stack((rows, columns)), axis=0, return_counts=True)
+    counts = np.bincount(
+        (rows - row_min) * width + (columns - column_min), minlength=size
+    )
+    occupied = np.flatnonzero(counts)
+    cells = np.column_stack(
+        (occupied // width + row_min, occupied % width + column_min)
+    )
+    return cells, counts[occupied]
+
+
 def _fit_phase(
     observation: _Observation,
     cell_u: float,
@@ -495,13 +536,10 @@ def _fit_phase(
     min_u, min_v, _max_u, _max_v = observation.geometry_uv.bounds
     origin_u = min_u - phase_u
     origin_v = min_v - phase_v
-    rows, columns = np.nonzero(observation.mask)
-    mask_u = observation.u[columns]
-    mask_v = observation.v[rows]
+    mask_u, mask_v = observation.mask_coordinates
     cell_columns = np.floor((mask_u - origin_u) / cell_u).astype(np.int64)
     cell_rows = np.floor((mask_v - origin_v) / cell_v).astype(np.int64)
-    pairs = np.column_stack((cell_rows, cell_columns))
-    unique, counts = np.unique(pairs, axis=0, return_counts=True)
+    unique, counts = _cell_counts(cell_rows, cell_columns)
     cell_area = cell_u * cell_v
     pixel_area = observation.resolution_m**2
     coverage = counts * pixel_area / cell_area

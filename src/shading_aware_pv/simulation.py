@@ -10,9 +10,15 @@ import numpy as np
 from .geometry import load_roof_scene, mesh_footprint
 from .clean_slate import bare_roof_placement
 from .inputs import SimulationInputs, load_context_scene
-from .irradiance import facet_irradiance, integrate_irradiance
+from .irradiance import IrradianceCache
 from .models import IrradianceResult, RoofResource, RoofSamples, Weather
-from .optimization import optimize_placements, placement_audit, select_milp, optimize_relocation, retain_installed_layout
+from .optimization import (
+    PlacementAuditor,
+    optimize_placements,
+    optimize_relocation,
+    retain_installed_layout,
+    select_milp,
+)
 from .panels import (
     NoPVModulesError,
     _merge_meshes,
@@ -226,18 +232,15 @@ def simulate(
         context_no_vegetation=local & context_bare,
         full=local & context_full,
     )
+    irradiance_cache = IrradianceCache()
     results = {}
     for source, states in (
         (open_horizon_weather, ("open_horizon",)),
         (weather, tuple(YIELD_STATES)[1:]),
     ):
-        components = facet_irradiance(receivers, source)
+        fields = irradiance_cache.for_samples(receivers, source)
         for state in states:
-            energy = integrate_irradiance(components, visibility[state])
-            results[state] = IrradianceResult(
-                energy.sum(axis=0, dtype=np.float64) / 1000.0,
-                ((components["direct"] > 20.0) & ~visibility[state]).sum(axis=0),
-            )
+            results[state] = IrradianceResult(*fields.annual_totals(visibility[state]))
     resource = RoofResource(
         scene.samples, receivers, roof_use_labels(scene, layout), results
     )
@@ -263,15 +266,23 @@ def simulate(
         snow_num_strings_basis=strings_basis,
     )
 
+    # Keep each sample's annual mask contiguous so each layout gathers columns
+    # without scanning strided full-roof arrays. Include bare-roof shade once.
+    yield_visibility = {
+        state: np.asfortranarray(mask if layout or state != "full" else mask & base)
+        for state, mask in visibility.items()
+    }
+
     def analyze(indices, electrical, *, include_hourly=True):
         analysis = analyze_yield(
             _subset(receivers, indices),
             weather,
-            {state: (mask if layout or state != "full" else mask & base)[:, indices]
-             for state, mask in visibility.items()},
+            yield_visibility,
             electrical,
             snow=snow if layout else None,
             state_weather={"open_horizon": open_horizon_weather},
+            irradiance_cache=irradiance_cache,
+            visibility_indices=indices,
         )
         energy_columns = [f"modeled_{state}_kwh" for state in visibility]
         monthly = analysis.hourly[energy_columns].resample("MS").sum()
@@ -331,6 +342,8 @@ def simulate(
             scene, receivers, weather, base, local, context_full,
             scene.partition.non_pv_mesh, **placement,
         )
+    auditor = PlacementAuditor(scene, scene.partition.non_pv_mesh)
+
     def design_for(solution, *, include_hourly=True, electrical=None):
         design = {
             "panel_count": solution.panel_count,
@@ -338,9 +351,7 @@ def simulate(
                 optimization.candidates[i].receiver_corners_xyz.tolist()
                 for i in solution.candidate_ids
             ],
-            "geometry_check": placement_audit(
-                scene, scene.partition.non_pv_mesh, optimization, solution
-            ),
+            "geometry_check": auditor.audit(optimization, solution),
         }
         if solution.panel_count:
             electrical = electrical or default_electrical_inputs(
@@ -383,9 +394,7 @@ def simulate(
             **(designs["installed"] if retained else proposed),
             "requested_panel_count": count, "same_count_feasible": True,
             "retained_installed": retained,
-            "geometry_check": placement_audit(
-                scene, scene.partition.non_pv_mesh, selected, selected.relocated_layout
-            ),
+            "geometry_check": auditor.audit(selected, selected.relocated_layout),
         }
     progress("Preparing solar results")
     mesh = scene_mesh(scene)

@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pvlib
 
-from .irradiance import facet_irradiance, integrate_irradiance
+from .irradiance import IrradianceCache, integrate_irradiance
 from .models import PanelLayout, RoofSamples, Weather
 from .snow import SnowData, effective_snow_loss, snow_loss_by_sample
 
@@ -167,25 +167,48 @@ def analyze_yield(
     *,
     snow: SnowData | None = None,
     state_weather: dict[str, Weather] | None = None,
+    irradiance_cache: IrradianceCache | None = None,
+    visibility_indices: np.ndarray | None = None,
 ) -> YieldAnalysis:
+    """Analyze a layout, optionally selecting its columns from shared visibility.
+
+    visibility_indices maps layout samples to the supplied full-roof masks.
+    Compact reductions gather each face directly; observed snow retains the
+    original dense selection and sample-level calculation.
+    """
     samples = layout if isinstance(layout, RoofSamples) else layout.samples
+    if visibility_indices is not None:
+        visibility_indices = np.asarray(visibility_indices)
+        if visibility_indices.shape != (len(samples.points),):
+            raise ValueError("Visibility indices must identify every roof sample")
     if snow is None:
         snow = SnowData(None, None, {"available": False, "reason": "not supplied"})
+    if inputs.snow_num_strings < 1:
+        raise ValueError("Snow num_strings must be positive")
     states = tuple(visibility)
     state_weather = state_weather or {}
-    weather_by_state = {
-        state: state_weather.get(state, weather) for state in states
-    }
+    weather_by_state = {state: state_weather.get(state, weather) for state in states}
     if any(
         not value.hourly.index.equals(weather.hourly.index)
         for value in weather_by_state.values()
     ):
         raise ValueError("All shading states must use the same timestamps")
     weather_sources = {id(source): source for source in weather_by_state.values()}
-    component_cache = {
-        key: facet_irradiance(samples, source)
+    irradiance_cache = irradiance_cache or IrradianceCache()
+    face_fields = {
+        key: irradiance_cache.for_samples(samples, source)
         for key, source in weather_sources.items()
     }
+    # Preserve sample-level POA and the observed-snow model exactly when snow
+    # is available. Without snow only area-weighted hourly quantities are needed.
+    compact = (
+        not snow.available
+        and samples.areas.dtype == np.float64
+        and np.all(samples.areas >= 0)
+    )
+    component_cache = (
+        {} if compact else {key: fields.dense() for key, fields in face_fields.items()}
+    )
     index = weather.hourly.index.floor("h")
     if index.has_duplicates:
         raise ValueError("Weather timestamps are not unique after hourly alignment")
@@ -197,37 +220,54 @@ def analyze_yield(
     shaded_hours: dict[str, float] = {}
     for state in states:
         state_source = weather_by_state[state]
-        components = component_cache[id(state_source)]
-        energy = integrate_irradiance(components, visibility[state])
-        poa = _weighted_mean(energy, samples.areas)
-        direct = _weighted_mean(
-            components["direct"] * visibility[state],
-            samples.areas,
-        )
+        if not compact:
+            components = component_cache[id(state_source)]
+            state_visibility = visibility[state]
+            if visibility_indices is not None:
+                state_visibility = state_visibility[:, visibility_indices]
+            energy = integrate_irradiance(components, state_visibility)
+            poa = _weighted_mean(energy, samples.areas)
+            direct = _weighted_mean(
+                components["direct"] * state_visibility,
+                samples.areas,
+            )
+            mean_shaded_hours = float(
+                np.average(
+                    ((components["direct"] > 20.0) & ~state_visibility).sum(axis=0),
+                    weights=samples.areas,
+                )
+            )
+        else:
+            poa, direct, mean_shaded_hours = face_fields[id(state_source)].shaded_means(
+                visibility[state], samples.areas, visibility_indices
+            )
         cell_temperature = pvlib.temperature.faiman(
             poa,
             state_source.hourly["temp_air"].to_numpy(),
             state_source.hourly["wind_speed"].to_numpy(),
         )
-        snow_coverage, snow_loss_by_receiver = snow_loss_by_sample(
-            energy,
-            samples,
-            state_source,
-            snow,
-            inputs.snow_num_strings,
-        )
-        snow_loss = effective_snow_loss(
-            energy,
-            snow_loss_by_receiver,
-            samples.areas,
-        )
+        if snow.available:
+            snow_coverage, snow_loss_by_receiver = snow_loss_by_sample(
+                energy,
+                samples,
+                state_source,
+                snow,
+                inputs.snow_num_strings,
+            )
+            snow_loss = effective_snow_loss(
+                energy,
+                snow_loss_by_receiver,
+                samples.areas,
+            )
+            mean_snow_coverage = _weighted_mean(snow_coverage, samples.areas)
+        else:
+            dtype = np.result_type(np.float32, samples.areas.dtype)
+            mean_snow_coverage = np.zeros(len(weather.hourly), dtype=dtype)
+            snow_loss = np.zeros(len(weather.hourly), dtype=dtype)
         hourly[f"poa_{state}_w_m2"] = poa
         hourly[f"poa_direct_{state}_w_m2"] = direct
         hourly[f"cell_temperature_{state}_c"] = cell_temperature
-        hourly[f"snow_coverage_{state}_fraction"] = _weighted_mean(
-            snow_coverage,
-            samples.areas,
-        )
+        hourly[f"snow_coverage_{state}_fraction"] = mean_snow_coverage
         hourly[f"snow_dc_loss_{state}_fraction"] = snow_loss
         hourly[f"ideal_dc_{state}_kwh"] = ideal_dc_energy(
             poa,
@@ -245,22 +285,14 @@ def analyze_yield(
             inputs,
             snow_loss,
         )
-        shaded_hours[state] = float(
-            np.average(
-                ((components["direct"] > 20.0) & ~visibility[state]).sum(axis=0),
-                weights=samples.areas,
-            )
-        )
+        shaded_hours[state] = mean_shaded_hours
 
-    default_components = component_cache[id(weather)]
-    hourly["poa_sky_diffuse_w_m2"] = _weighted_mean(
-        default_components["sky"],
-        samples.areas,
-    )
-    hourly["poa_ground_diffuse_w_m2"] = _weighted_mean(
-        default_components["ground"],
-        samples.areas,
-    )
+    for name in ("sky", "ground"):
+        hourly[f"poa_{name}_diffuse_w_m2"] = (
+            _weighted_mean(component_cache[id(weather)][name], samples.areas)
+            if not compact
+            else face_fields[id(weather)].diffuse_mean(name, samples.areas)
+        )
 
     metrics = {
         state: {"modeled_kwh": float(hourly[f"modeled_{state}_kwh"].sum())}
@@ -280,12 +312,9 @@ def analyze_yield(
         previous_ac = float(hourly[f"modeled_{previous}_kwh"].sum())
         metrics[state].update(
             {
-                "ideal_dc_kwh": float(
-                    hourly[f"ideal_dc_{state}_kwh"].sum()
-                ),
+                "ideal_dc_kwh": float(hourly[f"ideal_dc_{state}_kwh"].sum()),
                 "ideal_dc_specific_yield_kwh_per_kwp": float(
-                    hourly[f"ideal_dc_{state}_kwh"].sum()
-                    / inputs.dc_capacity_kwp
+                    hourly[f"ideal_dc_{state}_kwh"].sum() / inputs.dc_capacity_kwp
                 ),
                 "annual_direct_poa_kwh_m2": direct / 1000.0,
                 "annual_total_poa_kwh_m2": poa / 1000.0,
@@ -293,16 +322,12 @@ def analyze_yield(
                 "direct_loss_vs_baseline_percent": percent_loss(
                     direct, baseline_direct
                 ),
-                "total_poa_loss_vs_baseline_percent": percent_loss(
-                    poa, baseline_poa
-                ),
+                "total_poa_loss_vs_baseline_percent": percent_loss(poa, baseline_poa),
                 "ac_loss_vs_baseline_percent": percent_loss(ac, baseline_ac),
                 "direct_incremental_loss_percent": percent_loss(
                     direct, previous_direct
                 ),
-                "total_poa_incremental_loss_percent": percent_loss(
-                    poa, previous_poa
-                ),
+                "total_poa_incremental_loss_percent": percent_loss(poa, previous_poa),
                 "ac_incremental_loss_percent": percent_loss(ac, previous_ac),
                 "snow_loss_kwh": float(
                     hourly[f"modeled_no_snow_{state}_kwh"].sum() - ac

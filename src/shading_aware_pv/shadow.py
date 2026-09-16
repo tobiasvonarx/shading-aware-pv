@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -32,6 +33,30 @@ FRAGMENT_SHADER = """
 #version 330
 void main() {}
 """
+
+
+def _depth_subimage_reader(ctx: moderngl.Context):
+    """Load optional subimage reads using this renderer's EGL context.
+
+    ModernGL 5.12 exposes only whole-texture reads. This extension uses the
+    same depth conversion as those reads; framebuffer reads and shader texture
+    sampling can differ by one float ULP. Keep the full read on older drivers.
+    """
+    if ctx.version_code < 450 and "GL_ARB_get_texture_sub_image" not in ctx.extensions:
+        return None
+    # Resolve through ModernGL's own context loader, without another GL library.
+    address = ctx.mglo._context.load("glGetTextureSubImage")
+    if not address:
+        return None
+    return ctypes.CFUNCTYPE(
+        None,
+        ctypes.c_uint,  # texture
+        *([ctypes.c_int] * 7),  # level, offsets, dimensions
+        ctypes.c_uint,
+        ctypes.c_uint,  # format, type
+        ctypes.c_int,
+        ctypes.c_void_p,  # buffer size, destination
+    )(address)
 
 
 def sun_vectors(zenith: np.ndarray, azimuth: np.ndarray) -> np.ndarray:
@@ -89,7 +114,9 @@ class DepthRenderer:
         self.lower = local_vertices.min(axis=0) - self.depth_epsilon * 2
         self.upper = local_vertices.max(axis=0) + self.depth_epsilon * 2
         self.center = (self.lower + self.upper) / 2
-        self.half_extent = float(np.linalg.norm(self.upper - self.lower) / 2 + self.pixel_size)
+        self.half_extent = float(
+            np.linalg.norm(self.upper - self.lower) / 2 + self.pixel_size
+        )
         ideal_resolution = int(np.ceil(2 * self.half_extent / self.pixel_size))
         self.resolution = max(32, min(self.max_resolution, ideal_resolution))
         self.ctx = moderngl.create_standalone_context(backend="egl")
@@ -110,6 +137,7 @@ class DepthRenderer:
             self.vertex_arrays.append((vao, buffer))
         self.local_queries = self.query_points - self.origin
         self.corners = _box_corners(self.lower, self.upper)
+        self._read_subimage = _depth_subimage_reader(self.ctx)
 
     def close(self) -> None:
         arrays = [item for item in self.vertex_arrays if item is not None]
@@ -145,18 +173,49 @@ class DepthRenderer:
             if mesh_array is not None:
                 mesh_array[0].render(mode=moderngl.TRIANGLES)
 
-        depth = np.frombuffer(self.depth_texture.read(alignment=1), dtype=np.float32).reshape(
-            self.resolution, self.resolution
-        )
         relative = self.local_queries - self.center
         ndc_x = relative @ right / self.half_extent
         ndc_y = relative @ up / self.half_extent
-        pixel_x = np.clip(((ndc_x + 1) * 0.5 * self.resolution).astype(int), 0, self.resolution - 1)
-        pixel_y = np.clip(((ndc_y + 1) * 0.5 * self.resolution).astype(int), 0, self.resolution - 1)
+        pixel_x = np.clip(
+            ((ndc_x + 1) * 0.5 * self.resolution).astype(int), 0, self.resolution - 1
+        )
+        pixel_y = np.clip(
+            ((ndc_y + 1) * 0.5 * self.resolution).astype(int), 0, self.resolution - 1
+        )
         expected_depth = 1.0 - ((relative @ sun - q_min) / q_span)
-        sampled_depth = depth[pixel_y, pixel_x]
+        sampled_depth = self._sample_depth(pixel_x, pixel_y)
         tolerance = self.depth_epsilon / q_span
         return expected_depth <= sampled_depth + tolerance
+
+    def _sample_depth(self, pixel_x: np.ndarray, pixel_y: np.ndarray) -> np.ndarray:
+        """Read only queried texels' rectangle, retaining depth conversion."""
+        if not len(pixel_x):
+            return np.empty(0, dtype=np.float32)
+        if self._read_subimage is None:
+            depth = np.frombuffer(
+                self.depth_texture.read(alignment=1), dtype=np.float32
+            )
+            return depth.reshape(self.resolution, self.resolution)[pixel_y, pixel_x]
+        x_min, y_min = int(pixel_x.min()), int(pixel_y.min())
+        width = int(pixel_x.max()) - x_min + 1
+        height = int(pixel_y.max()) - y_min + 1
+        # This context has no pixel-pack buffer; float32 rows are 4-byte aligned.
+        depth = np.empty((height, width), dtype=np.float32)
+        self._read_subimage(
+            self.depth_texture.glo,
+            0,
+            x_min,
+            y_min,
+            0,
+            width,
+            height,
+            1,
+            0x1902,
+            0x1406,  # GL_DEPTH_COMPONENT, GL_FLOAT
+            depth.nbytes,
+            depth.ctypes.data,
+        )
+        return depth[pixel_y - y_min, pixel_x - x_min]
 
 
 def render_visibility(

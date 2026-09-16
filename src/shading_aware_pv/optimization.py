@@ -559,77 +559,131 @@ def _cover_height(corners: np.ndarray, triangles: np.ndarray) -> float:
     return maximum
 
 
+class PlacementAuditor:
+    """Reuse invariant geometry while auditing layouts of one unchanged scene.
+
+    The simulation owns the auditor. Candidate keys contain actual corners, not
+    IDs, because relocation introduces a different candidate pool. Clearances
+    are also part of the key; spacing is checked separately for every layout.
+    """
+
+    def __init__(self, scene: RoofScene, exclusion_footprint: Mesh | BaseGeometry):
+        self.facets = {
+            facet.facet_id: facet for facet in roof_facets(scene.partition.main_roof)
+        }
+        self.details = exclusion_footprint
+        self.triangles = scene.partition.non_pv_mesh.triangles
+        self._projections = {}
+        self._allowed = {}
+        self._checks = {}
+
+    def _candidate_check(
+        self, candidate: PlacementCandidate, optimization: PlacementOptimization
+    ) -> tuple[BaseGeometry, float, float, float, int]:
+        key = (
+            candidate.facet_id,
+            candidate.roof_corners_xyz.dtype.str,
+            candidate.roof_corners_xyz.tobytes(),
+            candidate.receiver_corners_xyz.dtype.str,
+            candidate.receiver_corners_xyz.tobytes(),
+            optimization.roof_setback_m,
+            optimization.obstruction_setback_m,
+        )
+        if key not in self._checks:
+            facet = self.facets[candidate.facet_id]
+            if facet.facet_id not in self._projections:
+                roof_uv = shapely.make_valid(facet.xy_to_uv(facet.polygon_xy))
+                details_xy = facet_exclusions(facet, self.details)
+                details_uv = (
+                    shapely.make_valid(facet.xy_to_uv(details_xy))
+                    if not details_xy.is_empty
+                    else details_xy
+                )
+                self._projections[facet.facet_id] = (roof_uv, details_uv)
+            roof_uv, details_uv = self._projections[facet.facet_id]
+            allowed_key = (
+                facet.facet_id,
+                optimization.roof_setback_m,
+                optimization.obstruction_setback_m,
+            )
+            if allowed_key not in self._allowed:
+                self._allowed[allowed_key] = usable_facet(
+                    facet,
+                    self.details,
+                    optimization.roof_setback_m,
+                    optimization.obstruction_setback_m,
+                ).buffer(1e-8)
+            panel_uv = facet.xy_to_uv(Polygon(candidate.roof_corners_xyz[:, :2]))
+            cover = _cover_height(candidate.receiver_corners_xyz, self.triangles)
+            self._checks[key] = (
+                panel_uv,
+                float(panel_uv.distance(roof_uv.boundary)),
+                float(panel_uv.distance(details_uv))
+                if not details_uv.is_empty
+                else math.inf,
+                cover,
+                int(cover > 1e-5 or not self._allowed[allowed_key].covers(panel_uv)),
+            )
+        return self._checks[key]
+
+    def audit(
+        self, optimization: PlacementOptimization, solution: PlacementSolution
+    ) -> dict[str, float | int | None]:
+        minimum_roof = math.inf
+        minimum_obstruction = math.inf
+        panels_by_facet: dict[str, list[BaseGeometry]] = {}
+        invalid = 0
+        covered = 0
+        maximum_cover = 0.0
+        for candidate_id in solution.candidate_ids:
+            candidate = optimization.candidates[int(candidate_id)]
+            panel_uv, roof_clearance, obstruction_clearance, cover_height, violation = (
+                self._candidate_check(candidate, optimization)
+            )
+            panels_by_facet.setdefault(candidate.facet_id, []).append(panel_uv)
+            minimum_roof = min(minimum_roof, roof_clearance)
+            minimum_obstruction = min(minimum_obstruction, obstruction_clearance)
+            maximum_cover = max(maximum_cover, cover_height)
+            covered += int(cover_height > 1e-5)
+            invalid += violation
+
+        minimum_module_gap = min(
+            (
+                float(left.distance(right))
+                for panels in panels_by_facet.values()
+                for index, left in enumerate(panels)
+                for right in panels[index + 1 :]
+            ),
+            default=math.inf,
+        )
+
+        selected = set(map(int, solution.candidate_ids))
+        spacing_violations = sum(
+            int(int(left) in selected and int(right) in selected)
+            for left, right in optimization.conflict_pairs
+        )
+        return {
+            "minimum_roof_edge_or_ridge_clearance_m": (
+                None if math.isinf(minimum_roof) else minimum_roof
+            ),
+            "minimum_non_pv_obstruction_clearance_m": (
+                None if math.isinf(minimum_obstruction) else minimum_obstruction
+            ),
+            "minimum_module_gap_m": (
+                None if math.isinf(minimum_module_gap) else minimum_module_gap
+            ),
+            "containment_or_clearance_violations": invalid,
+            "covered_surface_violations": covered,
+            "maximum_cover_height_m": maximum_cover,
+            "panel_spacing_violations": spacing_violations,
+        }
+
+
 def placement_audit(
     scene: RoofScene,
     exclusion_footprint: Mesh | BaseGeometry,
     optimization: PlacementOptimization,
     solution: PlacementSolution,
 ) -> dict[str, float | int | None]:
-    """Audit clearances and independently test original full-mesh height order."""
-    facets = {facet.facet_id: facet for facet in roof_facets(scene.partition.main_roof)}
-    details = exclusion_footprint
-    minimum_roof = math.inf
-    minimum_obstruction = math.inf
-    panels_by_facet: dict[str, list[BaseGeometry]] = {}
-    invalid = 0
-    covered = 0
-    maximum_cover = 0.0
-    for candidate_id in solution.candidate_ids:
-        candidate = optimization.candidates[int(candidate_id)]
-        facet = facets[candidate.facet_id]
-        panel_uv = facet.xy_to_uv(Polygon(candidate.roof_corners_xyz[:, :2]))
-        panels_by_facet.setdefault(candidate.facet_id, []).append(panel_uv)
-        roof_uv = shapely.make_valid(facet.xy_to_uv(facet.polygon_xy))
-        minimum_roof = min(
-            minimum_roof,
-            float(panel_uv.distance(roof_uv.boundary)),
-        )
-        details_xy = facet_exclusions(facet, details)
-        if not details_xy.is_empty:
-            details_uv = shapely.make_valid(facet.xy_to_uv(details_xy))
-            minimum_obstruction = min(
-                minimum_obstruction,
-                float(panel_uv.distance(details_uv)),
-            )
-        allowed = usable_facet(
-            facet,
-            details,
-            optimization.roof_setback_m,
-            optimization.obstruction_setback_m,
-        )
-        cover_height = _cover_height(candidate.receiver_corners_xyz, scene.partition.non_pv_mesh.triangles)
-        maximum_cover = max(maximum_cover, cover_height)
-        is_covered = cover_height > 1e-5
-        covered += int(is_covered)
-        invalid += int(is_covered or not allowed.buffer(1e-8).covers(panel_uv))
-
-    minimum_module_gap = min(
-        (
-            float(left.distance(right))
-            for panels in panels_by_facet.values()
-            for index, left in enumerate(panels)
-            for right in panels[index + 1 :]
-        ),
-        default=math.inf,
-    )
-
-    selected = set(map(int, solution.candidate_ids))
-    spacing_violations = sum(
-        int(int(left) in selected and int(right) in selected)
-        for left, right in optimization.conflict_pairs
-    )
-    return {
-        "minimum_roof_edge_or_ridge_clearance_m": (
-            None if math.isinf(minimum_roof) else minimum_roof
-        ),
-        "minimum_non_pv_obstruction_clearance_m": (
-            None if math.isinf(minimum_obstruction) else minimum_obstruction
-        ),
-        "minimum_module_gap_m": (
-            None if math.isinf(minimum_module_gap) else minimum_module_gap
-        ),
-        "containment_or_clearance_violations": invalid,
-        "covered_surface_violations": covered,
-        "maximum_cover_height_m": maximum_cover,
-        "panel_spacing_violations": spacing_violations,
-    }
+    """Audit one layout; use PlacementAuditor to share work across layouts."""
+    return PlacementAuditor(scene, exclusion_footprint).audit(optimization, solution)
